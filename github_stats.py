@@ -6,9 +6,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import aiohttp
 import requests
-import uvloop
 
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())  # use uvloop
 
 ###############################################################################
 # Main Classes
@@ -39,19 +37,17 @@ class Queries(object):
         }
         try:
             async with self.semaphore:
-                r = await self.session.post(
-                    "https://api.github.com/graphql",
-                    headers=headers,
-                    json={"query": generated_query}
-                )
+                r = await self.session.post("https://api.github.com/graphql",
+                                            headers=headers,
+                                            json={"query": generated_query})
             return await r.json()
         except:
+            print("aiohttp failed for GraphQL query")
+            # Fall back on non-async requests
             async with self.semaphore:
-                r = requests.post(
-                    "https://api.github.com/graphql",
-                    headers=headers,
-                    json={"query": generated_query}
-                )
+                r = requests.post("https://api.github.com/graphql",
+                                  headers=headers,
+                                  json={"query": generated_query})
                 return r.json()
 
     async def query_rest(self, path: str, params: Optional[Dict] = None) -> Dict:
@@ -62,21 +58,21 @@ class Queries(object):
         :return: deserialized REST JSON output
         """
 
-        headers = {
-            "Authorization": f"token {self.access_token}",
-            }
-        if params is None:
-            params = dict()
-        if path.startswith("/"):
-            path = path[1:]
-
         for _ in range(60):
+            headers = {
+                "Authorization": f"token {self.access_token}",
+            }
+            if params is None:
+                params = dict()
+            if path.startswith("/"):
+                path = path[1:]
             try:
                 async with self.semaphore:
                     r = await self.session.get(f"https://api.github.com/{path}",
                                                headers=headers,
                                                params=tuple(params.items()))
                 if r.status == 202:
+                    # print(f"{path} returned 202. Retrying...")
                     print(f"A path returned 202. Retrying...")
                     await asyncio.sleep(2)
                     continue
@@ -470,23 +466,24 @@ Languages:
         """
         if self._lines_changed is not None:
             return self._lines_changed
-
-        async def fetch(repo):
-            additions, deletions = 0, 0
+        additions = 0
+        deletions = 0
+        for repo in await self.all_repos:
             r = await self.queries.query_rest(f"/repos/{repo}/stats/contributors")
             for author_obj in r:
-                if not isinstance(author_obj, dict) or not isinstance(author_obj.get("author", {}), dict):
+                # Handle malformed response from the API by skipping this repo
+                if (not isinstance(author_obj, dict)
+                        or not isinstance(author_obj.get("author", {}), dict)):
                     continue
-                if author_obj.get("author", {}).get("login", "") != self.username:
+                author = author_obj.get("author", {}).get("login", "")
+                if author != self.username:
                     continue
+
                 for week in author_obj.get("weeks", []):
                     additions += week.get("a", 0)
                     deletions += week.get("d", 0)
-            self._lines_changed = (additions, deletions)
-            return additions, deletions
 
-        results = await asyncio.gather(*[fetch(repo) for repo in await self.all_repos])
-        self._lines_changed = (sum(r[0] for r in results), sum(r[1] for r in results))
+        self._lines_changed = (additions, deletions)
         return self._lines_changed
 
     @property
@@ -498,12 +495,15 @@ Languages:
         if self._views is not None:
             return self._views
 
-        async def fetch(repo):
+        total = 0
+        for repo in await self.repos:
             r = await self.queries.query_rest(f"/repos/{repo}/traffic/views")
-            return sum(view.get("count", 0) for view in r.get("views", []))
+            for view in r.get("views", []):
+                total += view.get("count", 0)
 
-        self._views = sum(await asyncio.gather(*[fetch(repo) for repo in await self.repos]))
-        return self._views
+        self._views = total
+        return total
+
 
 ###############################################################################
 # Main Function
@@ -518,6 +518,7 @@ async def main() -> None:
     async with aiohttp.ClientSession() as session:
         s = Stats(user, access_token, session)
         print(await s.to_str())
+
 
 if __name__ == "__main__":
     asyncio.run(main())
